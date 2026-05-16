@@ -1,123 +1,51 @@
-#!/usr/bin/env python3
 import asyncio
 import json
 import sys
-import logging
-from rutp import RUTPConnection, ConnState
+from rutp import RUTPConnection
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+async def main():
+    loop = asyncio.get_running_loop()
+    client = RUTPConnection(loop)
+    await client.connect('127.0.0.1', 8888)
+    await asyncio.sleep(0.1)  # ждём завершения handshake
 
-class MessengerClient:
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.conn = None
-        self.username = None
-        self._connected = asyncio.Event()
+    queue = asyncio.Queue()
+    client.on_data = lambda data: queue.put_nowait(data)
 
-    async def connect(self):
-        loop = asyncio.get_running_loop()
-        self.conn = RUTPConnection(loop)
-        # Фоновая задача для отслеживания состояния
-        asyncio.create_task(self._watch_state())
-        await self.conn.connect(self.host, self.port)
-        # Ждём перехода в ESTABLISHED (максимум 5 секунд)
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            raise RuntimeError("Handshake timeout")
-        logger.info(f"Connected to {self.host}:{self.port}")
-        asyncio.create_task(self._receiver())
-
-    async def _watch_state(self):
-        while True:
-            if self.conn and self.conn._state == ConnState.ESTABLISHED:
-                self._connected.set()
-                break
-            await asyncio.sleep(0.05)
-
-    async def _receiver(self):
-        queue = asyncio.Queue()
-        self.conn.on_data = lambda data: queue.put_nowait(data)
+    async def receive():
         while True:
             data = await queue.get()
             try:
                 msg = json.loads(data.decode())
-                if msg.get("type") == "message":
-                    sender = msg.get("from", "?")
-                    text = msg.get("text", "")
-                    print(f"\n[Message from {sender}]: {text}")
-                    print("> ", end="", flush=True)
-                elif msg.get("type") == "ok":
-                    print(f"[OK] {msg.get('message')}")
-                elif msg.get("type") == "error":
-                    print(f"[ERROR] {msg.get('error')}")
-                elif msg.get("type") == "search_result":
-                    users = msg.get("users", [])
-                    if users:
-                        print("Found users: " + ", ".join(users))
-                    else:
-                        print("No users found.")
-            except Exception as e:
-                logger.error(f"Parse error: {e}")
+                if 'from' in msg:
+                    print(f"\n[Сообщение от {msg['from']}]: {msg['text']}\n> ", end='', flush=True)
+                elif msg.get('type') == 'ok':
+                    print(f"\n[OK] {msg['message']}\n> ", end='', flush=True)
+            except:
+                pass
 
-    async def _send_command(self, cmd_dict: dict):
-        if self.conn:
-            self.conn.send(json.dumps(cmd_dict).encode())
+    asyncio.create_task(receive())
 
-    async def run(self):
-        await self.connect()
-        print("RUTP Messenger Client")
-        print("Commands: register <name>, search <pattern>, send <user> <message>, exit")
-        loop = asyncio.get_running_loop()
-        while True:
-            line = await loop.run_in_executor(None, sys.stdin.readline)
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
+    async def ainput():
+        return await loop.run_in_executor(None, sys.stdin.readline)
+
+    print("Чат. Команды: reg <имя>, send <кому> <текст>, exit")
+    while True:
+        line = await ainput()
+        if not line:
+            break
+        line = line.strip()
+        if line.startswith('reg '):
+            name = line.split()[1]
+            client.send(json.dumps({'cmd': 'register', 'username': name}).encode())
+        elif line.startswith('send '):
             parts = line.split(maxsplit=2)
-            cmd = parts[0].lower()
-            if cmd == "exit":
-                await self.conn.close()
-                print("Bye!")
-                break
-            elif cmd == "register" and len(parts) == 2:
-                username = parts[1]
-                await self._send_command({"cmd": "register", "username": username})
-                self.username = username
-            elif cmd == "search" and len(parts) == 2:
-                pattern = parts[1]
-                await self._send_command({"cmd": "search", "pattern": pattern})
-            elif cmd == "send" and len(parts) == 3:
-                target = parts[1]
-                text = parts[2]
-                if not self.username:
-                    print("You must register first")
-                    continue
-                await self._send_command({"cmd": "message", "to": target, "text": text})
-            else:
-                print("Unknown command")
+            if len(parts) == 3:
+                _, to, text = parts
+                client.send(json.dumps({'cmd': 'message', 'to': to, 'text': text}).encode())
+        elif line == 'exit':
+            break
 
-async def main():
-    host = "127.0.0.1"
-    port = 8888
-    if len(sys.argv) > 1:
-        host = sys.argv[1]
-    if len(sys.argv) > 2:
-        port = int(sys.argv[2])
-    client = MessengerClient(host, port)
-    try:
-        await client.run()
-    except KeyboardInterrupt:
-        print("\nInterrupted")
-    except Exception as e:
-        logger.error(f"Client error: {e}")
-    finally:
-        if client.conn:
-            await client.conn.close()
+    await client.close()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
