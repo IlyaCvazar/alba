@@ -21,8 +21,10 @@ logger = logging.getLogger("ChatServer")
 
 USER_DB_FILE = "users.json"
 active_users: Dict[int, Tuple[RUTPConnection, dict]] = {}
+# Для ограничения количества соединений с IP
+ip_connections: Dict[str, int] = {}
+MAX_CONNS_PER_IP = 5
 
-# ---------- Инициализация базы данных сообщений ----------
 DB_FILE = "chat_history.db"
 
 def init_db():
@@ -66,7 +68,6 @@ def get_message_history(user1: int, user2: int, limit: int = 100) -> list:
     conn.close()
     return [{"from": row[0], "text": row[1], "timestamp": row[2]} for row in rows]
 
-# ---------- Функции работы с пользователями ----------
 def load_users() -> dict:
     if not os.path.exists(USER_DB_FILE):
         return {}
@@ -104,9 +105,17 @@ async def broadcast_user_list() -> None:
         del active_users[uid]
     logger.info(f"Broadcasted user list: {online_list}")
 
-# ---------- Обработчик клиента ----------
 async def handle_client(conn: RUTPConnection):
     addr = conn._remote_addr
+    ip = addr[0]
+    # Ограничение количества соединений с одного IP
+    ip_connections[ip] = ip_connections.get(ip, 0) + 1
+    if ip_connections[ip] > MAX_CONNS_PER_IP:
+        logger.warning(f"Too many connections from {ip}, rejecting")
+        ip_connections[ip] -= 1
+        conn.abort()
+        return
+
     logger.info(f"New client from {addr}")
     while conn._state != ConnState.ESTABLISHED:
         await asyncio.sleep(0.05)
@@ -130,6 +139,7 @@ async def handle_client(conn: RUTPConnection):
             logger.debug(f"Command {cmd} from {addr}")
 
             if cmd == "register":
+                # ... (без изменений)
                 login = msg.get("login")
                 password = msg.get("password")
                 name = msg.get("name")
@@ -169,14 +179,17 @@ async def handle_client(conn: RUTPConnection):
                 if found_id is None:
                     await send_message(conn, {"type": "error", "message": "Invalid login or password"})
                     continue
+                # Вытеснение старого соединения
                 if found_id in active_users:
                     old_conn, _ = active_users[found_id]
+                    logger.info(f"Kicking old connection for user {found_id} from {old_conn._remote_addr}")
                     await send_message(old_conn, {"type": "error", "message": "Logged in elsewhere"})
                     try:
-                        await old_conn.close()
+                        await asyncio.wait_for(old_conn.close(), timeout=1.0)
                     except:
                         old_conn.abort()
                     del active_users[found_id]
+                    await asyncio.sleep(0.1)  # дать время на закрытие
                 user_id = found_id
                 user_name = user_data["name"]
                 active_users[user_id] = (conn, {"name": user_name, "login": login})
@@ -198,6 +211,7 @@ async def handle_client(conn: RUTPConnection):
                 await broadcast_user_list()
 
             elif cmd == "message":
+                # ... (без изменений)
                 if user_id is None:
                     await send_message(conn, {"type": "error", "message": "Not logged in"})
                     continue
@@ -206,9 +220,7 @@ async def handle_client(conn: RUTPConnection):
                 if target_id is None or not text.strip():
                     continue
                 target_id = int(target_id)
-                # Сохраняем сообщение в базу
                 save_message(user_id, target_id, text)
-                # Если получатель онлайн – отправляем
                 if target_id in active_users:
                     target_conn, _ = active_users[target_id]
                     if target_conn._transport is not None:
@@ -254,6 +266,10 @@ async def handle_client(conn: RUTPConnection):
             del active_users[user_id]
             logger.info(f"User {user_id} disconnected")
             await broadcast_user_list()
+        # Уменьшаем счётчик соединений с IP
+        ip_connections[ip] = ip_connections.get(ip, 1) - 1
+        if ip_connections[ip] == 0:
+            del ip_connections[ip]
         try:
             await conn.close()
         except:
